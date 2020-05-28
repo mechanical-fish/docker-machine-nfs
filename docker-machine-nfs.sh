@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 #
 # The MIT License (MIT)
 # Copyright © 2015 Toni Van de Voorde <toni.vdv@gmail.com>
@@ -76,7 +76,7 @@ Examples:
 
     > Configure the /var/www folder with NFS and the options '-alldirs -maproot=0'
 
-  $ docker-machine-nfs test --mount-opts="noacl,async,nolock,vers=3,udp,noatime,actimeo=1"
+  $ docker-machine-nfs test --mount-opts="noacl,async,nolock,nfsvers=3,udp,noatime,actimeo=1"
 
     > Configure the /User folder with NFS and specific mount options.
 
@@ -91,21 +91,21 @@ EOF
 # @args:    error-message
 echoError ()
 {
-  echo "\033[0;31mFAIL\n\n$1 \033[0m"
+  printf "\033[0;31mFAIL\n\n$1 \033[0m\n"
 }
 
 # @info:    Prints warning messages
 # @args:    warning-message
 echoWarn ()
 {
-  echo "\033[0;33m$1 \033[0m"
+  printf "\033[0;33m$1 \033[0m\n"
 }
 
 # @info:    Prints success messages
 # @args:    success-message
 echoSuccess ()
 {
-  echo "\033[0;32m$1 \033[0m"
+  printf "\033[0;32m$1 \033[0m\n"
 }
 
 # @info:    Prints check messages
@@ -119,7 +119,7 @@ echoInfo ()
 # @args:    property-message
 echoProperties ()
 {
-  echo "\t\033[0;35m- $1 \033[0m"
+  printf "\t\033[0;35m- $1 \033[0m\n"
 }
 
 # @info:    Checks if a given property is set
@@ -139,6 +139,17 @@ setPropDefaults()
   prop_force_configuration_nfs=false
   prop_use_ip_range=false
   prop_timeout=
+}
+
+# @info:    Resolve APFS firmlinks to their actual location
+resolveHostPath()
+{
+  firmlinked_dir="/System/Volumes/Data$1"
+  if [ -d "$firmlinked_dir" ] ; then
+    echo $firmlinked_dir
+  else
+    echo $1
+  fi
 }
 
 # @info:    Parses and validates the CLI arguments
@@ -196,8 +207,14 @@ parseCli()
     esac
   done
 
+  if [ "$(isWsl)" = "true" ]; then
+    local default_shared_foder="/c/Users"
+  else
+    local default_shared_foder="/Users"
+  fi
+
   if [ ${#prop_shared_folders[@]} -eq 0 ]; then
-    prop_shared_folders+=("/Users")
+    prop_shared_folders+=("${default_shared_foder}")
   fi;
 
   echoInfo "Configuration:"
@@ -225,7 +242,9 @@ checkMachinePresence ()
 {
   echoInfo "machine presence ... \t\t\t"
 
-  if [ "" = "$(docker-machine ls $2 | sed 1d | grep -w "$1")" ]; then
+  machine_name=$(docker-machine ls $2 --filter "Name=^$1$" -q)
+
+  if [ "" = "${machine_name}" ]; then
     echoError "Could not find the machine '$1'!"; exit 1;
   fi
 
@@ -239,7 +258,7 @@ checkMachineRunning ()
 {
   echoInfo "machine running ... \t\t\t"
 
-  machine_state=$(docker-machine ls $2 | sed 1d | grep "^$1\s" | awk '{print $4}')
+  machine_state=$(docker-machine ls $2 --filter "Name=^$1$" --format "{{.State}}")
 
   if [ "Running" != "${machine_state}" ]; then
     echoError "The machine '$1' is not running but '${machine_state}'!";
@@ -254,22 +273,21 @@ checkMachineRunning ()
 # @return:  The driver used to create the machine
 getMachineDriver ()
 {
-  docker-machine ls $2 | sed 1d | grep "^$1\s" | awk '{print $3}'
+  docker-machine ls $2 --filter "Name=^$1$" --format "{{.DriverName}}"
 }
 
 # @info:    Loads mandatory properties from the docker machine
 lookupMandatoryProperties ()
 {
-  echoInfo "Lookup mandatory properties ... "
+  echoInfo "Lookup mandatory properties ... \t\t"
 
   prop_machine_ip=$(docker-machine ip $1)
 
   prop_machine_driver=$(getMachineDriver $1 "$2")
 
-  if [ "$prop_machine_driver" = "vmwarefusion" ]; then
+  if [ "$prop_machine_driver" = "vmwarefusion" ] || [ "$prop_machine_driver" = "vmware" ]; then
     prop_network_id="Shared"
-    prop_nfshost_ip=${prop_use_ip:-"$(ifconfig -m `route get 8.8.8.8 | awk '{if ($1 ~ /interface:/){print $2}}'` | awk 'sub(/inet /,""){print $1}')"}
-    prop_machine_ip=$prop_nfshost_ip
+    prop_nfshost_ip=${prop_use_ip:-"$(ifconfig -m `route get $prop_machine_ip | awk '{if ($1 ~ /interface:/){print $2}}'` | awk 'sub(/inet /,""){print $1}')"}
     if [ "" = "${prop_nfshost_ip}" ]; then
       echoError "Could not find the vmware fusion net IP!"; exit 1
     fi
@@ -325,7 +343,7 @@ lookupMandatoryProperties ()
     echoError "Could not find the virtualbox net name!"; exit 1
   fi
 
-  prop_nfshost_ip=$(VBoxManage list hostonlyifs |
+  prop_nfshost_ip=$(VBoxManage list hostonlyifs | tr -d '\r' |
     grep "${prop_network_id}$" -A 3 | grep IPAddress |
     cut -d ':' -f2 | xargs);
   if [ "" = "${prop_nfshost_ip}" ]; then
@@ -336,7 +354,7 @@ lookupMandatoryProperties ()
 }
 
 # @info:    Configures the NFS
-configureNFS()
+configureNFSUnix()
 {
   echoInfo "Configure NFS ... \n"
 
@@ -369,7 +387,7 @@ configureNFS()
   for shared_folder in "${prop_shared_folders[@]}"
   do
     # Add new exports
-    exports="${exports}\"$shared_folder\" $machine_ip $prop_nfs_config\n"
+    exports="${exports}\"$(resolveHostPath "$shared_folder")\" $machine_ip $prop_nfs_config\n"
   done
 
   # Write new exports block ending
@@ -380,6 +398,32 @@ configureNFS()
   sudo nfsd restart ; sleep 2 && sudo nfsd checkexports
 
   echoSuccess "\t\t\t\t\t\tOK"
+}
+
+configureNFSWsl()
+{
+  echoInfo "Configure NFS ... \n"
+
+  local nfsdPath=$(sc.exe qc nfsserver | grep BINARY_PATH_NAME | awk '{split($0,a," : "); print a[2]}' | awk '{sub("nfsd.exe","",$0);}1' | awk '{sub("\\","/",$0);}1')
+  local wslnfsdPath=$(wslpath -a "$nfsdPath" | tr -d '\r')
+  wslnfsdPath+="exports"
+
+  if [ ! -f "$wslnfsdPath" ]; then
+    echoError "Configuration file was not found in $wslnfsdPath, please check installation of haneWin server"
+    exit 1
+  fi
+
+  for shared_folder in "${prop_shared_folders[@]}"
+  do
+    local wsl_shared_folder=$(wslpath -w $shared_folder)
+    echo "$wsl_shared_folder -alldirs -exec -mapall:1000,1000 #Added by docker-machine-nfs" >> "$wslnfsdPath"
+  done
+
+  echoProperties "$(net.exe stop nfsserver)"
+  echoProperties "$(net.exe start nfsserver)"
+
+  echoInfo "NFS server ... \t\t\t\t"
+  echoSuccess "OK"
 }
 
 # @info:    Configures the VirtualBox Docker Machine to mount nfs
@@ -397,8 +441,15 @@ configureBoot2Docker()
   # render bootlocal.sh and copy bootlocal.sh over to Docker Machine
   # (this will override an existing /var/lib/boot2docker/bootlocal.sh)
 
-  local bootlocalsh='#!/bin/sh
-  sudo umount /Users'
+  local bootlocalsh="#!/bin/sh"
+
+  if [ "$(isWsl)" = "true" ]; then
+    bootlocalsh="${bootlocalsh}
+    sudo umount /c/Users"
+  else
+    bootlocalsh="${bootlocalsh}
+    sudo umount /Users"
+  fi
 
   for shared_folder in "${prop_shared_folders[@]}"
   do
@@ -407,19 +458,19 @@ configureBoot2Docker()
   done
 
   bootlocalsh="${bootlocalsh}
-  sudo /usr/local/etc/init.d/nfs-client start"
+    sudo /usr/local/etc/init.d/nfs-client start"
 
   for shared_folder in "${prop_shared_folders[@]}"
   do
     bootlocalsh="${bootlocalsh}
-    sudo mount -t nfs -o "$prop_mount_options" "$prop_nfshost_ip":\""$shared_folder"\" \""$shared_folder"\""
+    sudo mount -t nfs -o "$prop_mount_options" "$prop_nfshost_ip":\""$(resolveHostPath "$shared_folder")"\" \""$shared_folder"\""
   done
 
   local file="/var/lib/boot2docker/bootlocal.sh"
 
   docker-machine ssh $prop_machine_name \
-    "echo '$bootlocalsh' | sudo tee $file && sudo chmod +x $file && sync" > /dev/null
-
+    "echo '$bootlocalsh' | sudo tee $file && sudo chmod +x $file && sync" < /dev/null > /dev/null
+  
   sleep 2
 
   echoSuccess "OK"
@@ -444,8 +495,8 @@ isNFSMounted()
 {
   for shared_folder in "${prop_shared_folders[@]}"
   do
-    local nfs_mount=$(docker-machine ssh $prop_machine_name "sudo mount" |
-      grep "$prop_nfshost_ip:$prop_shared_folders on")
+    local nfs_mount=$(docker-machine ssh $prop_machine_name "sudo mount" < /dev/null | 
+      grep "$prop_nfshost_ip:$(resolveHostPath "$shared_folder") on")
     if [ "" = "$nfs_mount" ]; then
       echo "false";
       return;
@@ -478,7 +529,7 @@ verifyNFSMount()
 # @info:    Displays the finish message
 showFinish()
 {
-  echo "\033[0;36m"
+  printf "\033[0;36m"
   echo "--------------------------------------------"
   echo
   echo " The docker-machine '$prop_machine_name'"
@@ -487,8 +538,31 @@ showFinish()
   echo " ENJOY high speed mounts :D"
   echo
   echo "--------------------------------------------"
-  echo "\033[0m"
+  printf "\033[0m"
 }
+
+# WSL
+
+# @return:  'true', if platform is WSL; else 'false'
+isWsl()
+{
+  if [ "$(uname -r | grep 'Microsoft')" != "" ]; then
+    echo "true"
+  else
+    echo "false"
+  fi
+}
+
+if [ "$(isWsl)" = "true" ]; then
+  printf "\033[0;32mPlaform WSl detected\033[0m\n"
+
+# @info:    translate docker-machine to .exe
+  function docker-machine()
+  {
+    docker-machine.exe "$@"
+  }
+  export -f docker-machine
+fi
 
 # END _functions
 
@@ -501,7 +575,7 @@ checkMachineRunning $prop_machine_name "$prop_timeout"
 
 lookupMandatoryProperties $prop_machine_name "$prop_timeout"
 
-if [ "$(isNFSMounted)" = "true" ] && [ "$prop_force_configuration_nfs" = false ]; then
+if [ "$(isNFSMounted)" = "true" ] && [ "$prop_force_configuration_nfs" = "false" ]; then
     echoSuccess "\n NFS already mounted." ; showFinish ; exit 0
 fi
 
@@ -513,7 +587,11 @@ echoProperties "NFSHost IP: $prop_nfshost_ip"
 
 echo #EMPTY LINE
 
-configureNFS
+if [ "$(isWsl)" = "true" ]; then
+  configureNFSWsl
+else
+  configureNFSUnix
+fi
 
 configureBoot2Docker
 restartDockerMachine
